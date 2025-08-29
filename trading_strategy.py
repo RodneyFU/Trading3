@@ -1,18 +1,19 @@
 from stable_baselines3 import PPO
-import gym
+import gymnasium as gym
 import numpy as np
 import pandas as pd
 from ib_insync import IB, Forex, BracketOrder
 import logging
 from risk_management import check_resources, calculate_stop_loss, calculate_position_size
-from utils import load_settings # 新增導入以載入 config
-
+from utils import load_settings
+from ai_models import FEATURES                     
 class ForexEnv(gym.Env):
     """外匯環境：用於 PPO 強化學習訓練，支援多時間框架。"""
     # 類別說明：自定義 Gym 環境，用於模擬外匯交易，支援多時間框架觀察空間。
     def __init__(self, data_frames: dict, spread: float = 0.0002):
         super().__init__()
-        self.data_frames = data_frames # 接受多時間框架數據
+        tf_mapping = {'1 hour': '1h', '4 hours': '4h', '1 day': '1d'}
+        self.data_frames = {tf_mapping.get(k, k): v for k, v in data_frames.items()}
         self.spread = spread
         self.current_step = 0
         self.action_space = gym.spaces.Discrete(3) # 買, 賣, 持
@@ -25,15 +26,15 @@ class ForexEnv(gym.Env):
     def _get_obs(self):
         # 關鍵邏輯：從多時間框架提取觀察值，若數據不足則填充 0。
         obs = []
-        for tf in ['1h', '4h', 'daily']:
+        for tf in ['1h', '4h', '1d']:
             df = self.data_frames[tf]
             if self.current_step < len(df):
-                obs.extend(df[['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26']].iloc[self.current_step].values)
+                obs.extend(df[FEATURES[:-1]].iloc[self.current_step].values)  # 排除fed_funds_rate如果不需要
             else:
                 obs.extend([0] * 9) # 填充 0 以保持形狀一致
         return np.array(obs, dtype=np.float32)
     def step(self, action):
-        price = self.data_frames['1h']['Close'].iloc[self.current_step]
+        price = self.data_frames['1h']['close'].iloc[self.current_step]
         reward = 0
         if action == 0: # 買
             reward -= self.spread
@@ -42,7 +43,6 @@ class ForexEnv(gym.Env):
         self.current_step += 1
         done = self.current_step >= min(len(self.data_frames[tf]) for tf in self.data_frames) - 1
         return self._get_obs(), reward, done, {}
-
 def train_ppo(env, device_config: dict = None):
     """訓練 PPO：強化學習優化交易決策。，從 config 載入參數。
     邏輯：使用 MlpPolicy，根據配置的步數學習，保存模型。
@@ -62,7 +62,6 @@ def train_ppo(env, device_config: dict = None):
     except Exception as e:
         logging.error(f"PPO 訓練錯誤: {e}")
         return None
-
 def make_decision(model, data_frames: dict, sentiment: float) -> str:
     """產生決策：結合多時間框架技術指標和情緒分數。"""
     # 函數說明：結合技術指標、情緒分數和 PPO 模型產生買賣持倉決策。
@@ -74,7 +73,7 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
         # 多框架技術指標邏輯
         buy_signals = []
         sell_signals = []
-        for tf in ['1h', '4h', 'daily']:
+        for tf in ['1h', '4h', '1d']:
             df = data_frames[tf]
             if df.empty:
                 continue
@@ -83,16 +82,18 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
             macd_signal = df['MACD_signal'].iloc[-1]
             stoch_k = df['Stoch_k'].iloc[-1]
             adx = df['ADX'].iloc[-1]
-            ichimoku = df['Ichimoku_span_a'].iloc[-1] > df['Ichimoku_span_b'].iloc[-1] and \
-                       df['Close'].iloc[-1] > df['Ichimoku_cloud_top'].iloc[-1]
-            # Add Bollinger and EMA signals
-            bb_signal = df['Close'].iloc[-1] < df['BB_lower'].iloc[-1] # Buy if price below lower band
-            ema_signal = df['EMA_12'].iloc[-1] > df['EMA_26'].iloc[-1] # Buy if short EMA above long EMA
-            # Economic calendar impact
+            # 更新 Ichimoku 信號：考慮 Tenkan-sen 和 Kijun-sen
+            ichimoku_buy = (df['Ichimoku_tenkan'].iloc[-1] > df['Ichimoku_kijun'].iloc[-1] and
+                           df['close'].iloc[-1] > df['Ichimoku_cloud_top'].iloc[-1])
+            ichimoku_sell = (df['Ichimoku_tenkan'].iloc[-1] < df['Ichimoku_kijun'].iloc[-1] and
+                            df['close'].iloc[-1] < df['Ichimoku_cloud_top'].iloc[-1])
+            bb_signal = df['close'].iloc[-1] < df['BB_lower'].iloc[-1]
+            ema_signal = df['EMA_12'].iloc[-1] > df['EMA_26'].iloc[-1]
+									  
             economic_impact = df['impact'].iloc[-1] if 'impact' in df.columns and not pd.isna(df['impact'].iloc[-1]) else 'Low'
-            economic_pause = economic_impact in ['High', 'Medium'] # Pause trading on high/medium impact events
-            buy_signals.append(rsi < 30 and macd > macd_signal and stoch_k < 20 and adx > 25 and ichimoku and bb_signal and ema_signal and not economic_pause)
-            sell_signals.append(rsi > 70 and macd < macd_signal and stoch_k > 80 and adx > 25 and not ichimoku and df['Close'].iloc[-1] > df['BB_upper'].iloc[-1] and df['EMA_12'].iloc[-1] < df['EMA_26'].iloc[-1] and not economic_pause)
+            economic_pause = economic_impact in ['High', 'Medium']
+            buy_signals.append(rsi < 30 and macd > macd_signal and stoch_k < 20 and adx > 25 and ichimoku_buy and bb_signal and ema_signal and not economic_pause)
+            sell_signals.append(rsi > 70 and macd < macd_signal and stoch_k > 80 and adx > 25 and ichimoku_sell and df['close'].iloc[-1] > df['BB_upper'].iloc[-1] and df['EMA_12'].iloc[-1] < df['EMA_26'].iloc[-1] and not economic_pause)
         # 關鍵邏輯：計算買賣信號分數並根據情緒調整。
         buy_score = sum(1 for s in buy_signals if s) / len(buy_signals) if buy_signals else 0
         sell_score = sum(1 for s in sell_signals if s) / len(sell_signals) if sell_signals else 0
@@ -105,10 +106,10 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
         sell_score -= sentiment_adjust
         # PPO 決策
         obs = []
-        for tf in ['1h', '4h', 'daily']:
+        for tf in ['1h', '4h', '1d']:
             df = data_frames.get(tf, pd.DataFrame())
             if not df.empty:
-                obs.extend(df[['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26']].iloc[-1].values)
+                obs.extend(df[FEATURES[:-1]].iloc[-1].values)  # 排除fed_funds_rate
             else:
                 obs.extend([0] * 9)
         action, _ = model.predict(np.array(obs, dtype=np.float32))
@@ -122,7 +123,6 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
     except Exception as e:
         logging.error(f"決策錯誤: {e}")
         return "持有"
-
 def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 10000, spread: float = 0.0002) -> dict:
     """回測：模擬交易，計算績效指標，包含持倉管理。"""
     # 函數說明：模擬歷史數據上的交易決策，計算最終資本、夏普比率等指標。
@@ -137,7 +137,7 @@ def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 1000
             logging.warning("資源不足，跳過交易")
             continue
         action = strategy(row)
-        current_price = row['Close']
+        current_price = row['close']
         sentiment = row.get('sentiment', 0.0)
         atr = row['ATR']
         stop_loss_distance = abs(calculate_stop_loss(current_price, atr) - current_price)
@@ -157,6 +157,8 @@ def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 1000
             position_size = calc_position
             total_cost = current_price * position_size
             entry_price = current_price
+            leverage_cost = abs(position_size) * 0.0001  # 假設 0.01% 融資成本
+            capital -= leverage_cost
             trades.append({
                 'date': row['date'],
                 'action': '買入',
@@ -178,6 +180,8 @@ def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 1000
             position_size = -calc_position
             total_cost = -current_price * abs(position_size)
             entry_price = current_price
+            leverage_cost = abs(position_size) * 0.0001  # 假設 0.01% 融資成本
+            capital -= leverage_cost
             trades.append({
                 'date': row['date'],
                 'action': '賣出',
@@ -195,7 +199,6 @@ def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 1000
         "win_rate": len([r for r in returns if r > 0]) / len(returns) if len(returns) > 0 else 0,
         "trades": trades
     }
-
 def connect_ib(host='127.0.0.1', port=7497, client_id=1):
     """連接 IB API：用於實時交易。
     邏輯：建立連接，返回 IB 物件。
@@ -204,7 +207,6 @@ def connect_ib(host='127.0.0.1', port=7497, client_id=1):
     ib = IB()
     ib.connect(host, port, client_id)
     return ib
-
 def execute_trade(ib, action: str, price: float, quantity: float, stop_loss: float, take_profit: float):
     """執行交易：使用括號訂單。
     邏輯：根據行動創建訂單，附加止損/止盈。

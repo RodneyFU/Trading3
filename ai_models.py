@@ -19,13 +19,15 @@ from pathlib import Path
 import joblib
 import redis
 from sklearn.metrics import mean_squared_error, r2_score
-from utils import save_data, check_hardware
-from datetime import timedelta
+from utils import save_data, check_hardware, get_redis_client
+from datetime import timedelta, datetime
 import asyncio
 import aiohttp
 from textblob import TextBlob
+import aiosqlite
 
-redis_client = redis.Redis(host='localhost', port=6379, db=0)
+# 全局特徵常量，避免重複定義
+FEATURES = ['close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
 
 class LSTMModel(nn.Module):
     """LSTM 模型：用於價格預測，捕捉時間序列模式。"""
@@ -36,21 +38,31 @@ class LSTMModel(nn.Module):
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
         self.to(device)
-  
+ 
     def forward(self, x):
         # 關鍵邏輯：將輸入數據移動到指定設備，並通過 LSTM 和全連接層進行前向傳播。
         x = x.to(self.device)
         _, (h_n, _) = self.lstm(x)
         return self.fc(h_n[-1])
-
+def validate_data(df: pd.DataFrame, required_features: list) -> bool:
+    """驗證輸入數據是否包含必要的特徵欄位。"""
+    missing_features = [f for f in required_features if f not in df.columns]
+    if missing_features:
+        logging.error(f"缺少必要特徵: {missing_features}")
+        return False
+    if df[required_features].isna().any().any():
+        logging.error("數據包含 NaN 值")
+        return False
+    return True
 def train_lstm_model(df: pd.DataFrame, epochs: int = 50, device=torch.device('cpu')):
     """訓練 LSTM：使用歷史數據訓練，保存為 ONNX 格式。"""
     # 函數說明：此函數負責訓練 LSTM 模型，使用指定的特徵進行價格預測，並將模型轉換為 ONNX 格式以便跨平台使用。
     try:
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
+        if not validate_data(df, FEATURES):
+            return None
         # 關鍵邏輯：移除 NaN 值並準備輸入 X 和目標 y（下一期的 Close 值）。
-        X = df[features].dropna().values[:-1]
-        y = df['Close'].shift(-1).dropna().values
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['close'].shift(-1).dropna().values
         if len(X) != len(y):
             logging.error("X 和 y 長度不匹配")
             return None
@@ -58,7 +70,7 @@ def train_lstm_model(df: pd.DataFrame, epochs: int = 50, device=torch.device('cp
             logging.error("X 數據為空，無法訓練 LSTM")
             return None
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        model = LSTMModel(input_size=len(features), device=device)
+        model = LSTMModel(input_size=len(FEATURES), device=device)
         optimizer = Adam(model.parameters(), lr=0.001)
         criterion = nn.MSELoss()
         # 關鍵邏輯：訓練循環，使用反向傳播更新模型參數。
@@ -68,7 +80,7 @@ def train_lstm_model(df: pd.DataFrame, epochs: int = 50, device=torch.device('cp
             loss = criterion(output.squeeze(), torch.tensor(y_train, dtype=torch.float32, device=device))
             loss.backward()
             optimizer.step()
-      
+     
         # 保存 PyTorch 模型
         torch.save(model.state_dict(), 'models/lstm_model.pth')
         # 轉換為 ONNX
@@ -83,14 +95,14 @@ def train_lstm_model(df: pd.DataFrame, epochs: int = 50, device=torch.device('cp
     except Exception as e:
         logging.error(f"LSTM 訓練錯誤: {e}")
         return None
-
 def train_xgboost_model(df: pd.DataFrame):
     """訓練 XGBoost 模型：用於短期價格預測，保存為 ONNX 格式。"""
     # 函數說明：訓練 XGBoost 模型，用於短期價格預測，並計算性能指標後轉換為 ONNX 格式。
     try:
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
-        X = df[features].dropna().values[:-1]
-        y = df['Close'].shift(-1).dropna().values
+        if not validate_data(df, FEATURES):
+            return None
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['close'].shift(-1).dropna().values
         if len(X) != len(y):
             logging.error("X 和 y 長度不匹配")
             return None
@@ -107,7 +119,7 @@ def train_xgboost_model(df: pd.DataFrame):
         logging.info(f"XGBoost 價格預測性能：RMSE={rmse:.4f}, R²={r2:.4f}")
         joblib.dump(model, 'models/xgboost_model.pkl')
         # 轉換為 ONNX
-        onnx_model = convert_xgboost(model, initial_types=[('input', FloatTensorType([None, len(features)]))])
+        onnx_model = convert_xgboost(model, initial_types=[('input', FloatTensorType([None, len(FEATURES)]))])
         onnx.save(onnx_model, "models/xgboost_model.onnx")
         # 量化為 FP16
         model_fp32 = onnx.load("models/xgboost_model.onnx")
@@ -118,25 +130,26 @@ def train_xgboost_model(df: pd.DataFrame):
     except Exception as e:
         logging.error(f"XGBoost 訓練錯誤: {e}")
         return None
-
-def train_rf_model(df: pd.DataFrame):
-    """訓練 RandomForest 模型：用於中期預測，保存為 ONNX 格式。"""
+def train_random_forest_model(df: pd.DataFrame):
+    """訓練隨機森林模型：用於短期價格預測，保存為 ONNX 格式。"""
     # 函數說明：訓練 RandomForest 模型，用於中期價格預測，並轉換為 ONNX 格式。
     try:
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
-        X = df[features].dropna().values[:-1]
-        y = df['Close'].shift(-1).dropna().values
+        if not validate_data(df, FEATURES):
+            return None
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['close'].shift(-1).dropna().values
         if len(X) != len(y):
             logging.error("X 和 y 長度不匹配")
             return None
         if len(X) == 0:
             logging.error("X 數據為空，無法訓練 RandomForest")
             return None
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X, y)
+        model.fit(X_train, y_train)
         joblib.dump(model, 'models/rf_model.pkl')
         # 轉換為 ONNX
-        onnx_model = convert_sklearn(model, initial_types=[('input', FloatTensorType([None, len(features)]))])
+        onnx_model = convert_sklearn(model, initial_types=[('input', FloatTensorType([None, len(FEATURES)]))])
         onnx.save(onnx_model, "models/rf_model.onnx")
         # 量化為 FP16
         model_fp32 = onnx.load("models/rf_model.onnx")
@@ -147,13 +160,13 @@ def train_rf_model(df: pd.DataFrame):
     except Exception as e:
         logging.error(f"RandomForest 訓練錯誤: {e}")
         return None
-
 def train_lightgbm_model(df: pd.DataFrame):
     """訓練 LightGBM 模型：用於波動性預測（ATR），保存為 ONNX 格式。"""
     # 函數說明：訓練 LightGBM 模型，用於波動性預測，並與 XGBoost 比較性能後轉換為 ONNX 格式。
     try:
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
-        X = df[features].dropna().values[:-1]
+        if not validate_data(df, FEATURES):
+            return None
+        X = df[FEATURES].dropna().values[:-1]
         y = df['ATR'].shift(-1).dropna().values
         if len(X) != len(y):
             logging.error("X 和 y 長度不匹配")
@@ -179,7 +192,7 @@ def train_lightgbm_model(df: pd.DataFrame):
         logging.info(f"性能比較：LightGBM RMSE={rmse:.4f} vs XGBoost RMSE={xgb_rmse:.4f}, LightGBM R²={r2:.4f} vs XGBoost R²={xgb_r2:.4f}")
         joblib.dump(model, 'models/lightgbm_model.pkl')
         # 轉換為 ONNX
-        onnx_model = convert_lightgbm(model, initial_types=[('input', FloatTensorType([None, len(features)]))])
+        onnx_model = convert_lightgbm(model, initial_types=[('input', FloatTensorType([None, len(FEATURES)]))])
         onnx.save(onnx_model, "models/lightgbm_model.onnx")
         # 量化為 FP16
         model_fp32 = onnx.load("models/lightgbm_model.onnx")
@@ -190,26 +203,24 @@ def train_lightgbm_model(df: pd.DataFrame):
     except Exception as e:
         logging.error(f"LightGBM 訓練錯誤: {e}")
         return None
-
 def train_timeseries_transformer(df: pd.DataFrame, epochs: int = 10, device=torch.device('cpu')):
     """訓練 TimeSeriesTransformer 模型：用於時間序列預測，保存為 ONNX 格式。"""
     # 函數說明：訓練 TimeSeriesTransformer 模型，用於時間序列預測，處理序列數據並轉換為 ONNX 格式。
     try:
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
         seq_len = 60
         # 關鍵邏輯：移除 NaN 值並構造時間序列輸入 X 和目標 y。
-        df_clean = df.dropna(subset=features + ['Close'])
+        df_clean = df.dropna(subset=FEATURES + ['close'])
         num_seq = len(df_clean) - seq_len
         if num_seq <= 0:
             logging.error("數據不足以構造時間序列，無法訓練 TimeSeriesTransformer")
             return None
-        X = np.array([df_clean[features].iloc[i:i+seq_len].values for i in range(num_seq)])
-        y = df_clean['Close'].iloc[seq_len:].values
+        X = np.array([df_clean[FEATURES].iloc[i:i+seq_len].values for i in range(num_seq)])
+        y = df_clean['close'].iloc[seq_len:].values
         if len(X) != len(y):
             logging.error("X 和 y 長度不匹配")
             return None
         config = TimeSeriesTransformerConfig(
-            input_size=len(features), time_series_length=seq_len, prediction_length=1, d_model=64
+            input_size=len(FEATURES), time_series_length=seq_len, prediction_length=1, d_model=64
         )
         model = TimeSeriesTransformerModel(config).to(device)
         optimizer = Adam(model.parameters(), lr=0.001)
@@ -236,7 +247,6 @@ def train_timeseries_transformer(df: pd.DataFrame, epochs: int = 10, device=torc
     except Exception as e:
         logging.error(f"TimeSeriesTransformer 訓練錯誤: {e}")
         return None
-
 def train_distilbert(df: pd.DataFrame, device=torch.device('cpu')):
     """訓練 DistilBERT 模型：用於情緒分析，保存為 ONNX 格式。"""
     # 函數說明：訓練 DistilBERT 模型，用於情緒分析，處理文本數據並轉換為 ONNX 格式。
@@ -266,7 +276,7 @@ def train_distilbert(df: pd.DataFrame, device=torch.device('cpu')):
             'attention_mask': tokenizer(['dummy text'], return_tensors="pt", padding=True, truncation=True)['attention_mask'].to(device)
         }
         torch.onnx.export(model, (dummy_input['input_ids'], dummy_input['attention_mask']),
-                         "models/distilbert_model.onnx", input_names=["input_ids", "attention_mask"], output_names=["output"], opset_version=11)
+                          "models/distilbert_model.onnx", input_names=["input_ids", "attention_mask"], output_names=["output"], opset_version=11)
         # 量化為 FP16
         model_fp32 = onnx.load("models/distilbert_model.onnx")
         model_fp16 = convert_float_to_float16(model_fp32)
@@ -276,19 +286,27 @@ def train_distilbert(df: pd.DataFrame, device=torch.device('cpu')):
     except Exception as e:
         logging.error(f"DistilBERT 訓練錯誤: {e}")
         return None, None
-
 async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
     """情緒分析：從 X API 獲取推文，計算 polarity 並儲存結果，使用 DistilBERT，加入 Redis 快取。"""
     # 函數說明：進行情緒分析，從 X (Twitter) API 獲取推文，使用 DistilBERT 和 TextBlob 計算情緒分數，並快取結果。
+    use_redis = config.get('system_config', {}).get('use_redis', True)
+   
+    redis_client = get_redis_client(config)
     try:
         end_date = pd.to_datetime(date)
         start_date = end_date - timedelta(days=1)
         cache_key = f"sentiment_{end_date.strftime('%Y-%m-%d')}"
         # 關鍵邏輯：檢查 Redis 快取，若存在則直接返回。
-        cached = redis_client.get(cache_key)
-        if cached:
-            logging.info(f"從 Redis 快取載入情緒分數: {cache_key}")
-            return float(cached)
+        # 檢查 Redis 快取
+        if use_redis and redis_client:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    logging.info(f"從 Redis 快取載入情緒分數: {cache_key}")
+                    return float(cached)
+            except redis.RedisError as e:
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Redis 快取查詢失敗：{str(e)}，跳過 Redis")
+                logging.warning(f"Redis cache query failed: {str(e)}，falling back to API", extra={'mode': 'predict_sentiment'})
         start_time = start_date.strftime('%Y-%m-%dT00:00:00Z')
         end_time = end_date.strftime('%Y-%m-%dT23:59:59Z')
         X_BEARER_TOKEN = config['api_key'].get('x_bearer_token', '')
@@ -297,7 +315,7 @@ async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
             return 0.0
         query = "(USDJPY OR USD/JPY OR 'Federal Reserve') lang:en"
         logging.info(f"從 X API 獲取推文：query={query}, start={start_time}, end={end_time}")
-        url = "https://api.twitter.com/2/tweets/search/recent"
+        url = "https://api.x.com/2/tweets/search/recent"
         headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
         params = {'query': query, 'start_time': start_time, 'end_time': end_time, 'max_results': 100}
         polarities = []
@@ -336,7 +354,13 @@ async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
             avg_score = sum(polarities) / len(polarities)
             logging.info(f"計算平均 polarity 分數: {avg_score} (DistilBERT 70%, TextBlob 30%)")
             # 存入 Redis 快取，設置 24 小時過期
-            redis_client.setex(cache_key, 24 * 3600, str(avg_score))
+            if use_redis and redis_client:
+                try:
+                    redis_client.setex(cache_key, 24 * 3600, str(avg_score))
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將情緒分數快取至 Redis")
+                    logging.info(f"Cached sentiment score to Redis: key={cache_key}")
+                except redis.RedisError as e:
+                    logging.warning(f"無法快取至 Redis: {str(e)}")
         else:
             avg_score = 0.0
             logging.warning("無推文數據，使用預設值 0.0")
@@ -346,7 +370,6 @@ async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
     except Exception as e:
         logging.error(f"情緒分析錯誤: {e}")
         return 0.0
-
 def integrate_sentiment(polarity: float) -> float:
     """整合情緒分數：將 polarity 轉換為決策調整值，並檢查極端情緒。"""
     # 函數說明：根據情緒分數調整決策值，若極端則暫停交易。
@@ -358,25 +381,21 @@ def integrate_sentiment(polarity: float) -> float:
     elif polarity < -0.1:
         return -0.1
     return 0.0
-
 def detect_drift(old_data: pd.DataFrame, new_data: pd.DataFrame, threshold: float = 0.05) -> bool:
     """檢測數據漂移：使用 KS 檢驗比較分佈。"""
     # 函數說明：使用 Kolmogorov-Smirnov 檢驗檢測數據分佈漂移。
-    stat, p_value = ks_2samp(old_data['Close'], new_data['Close'])
+    stat, p_value = ks_2samp(old_data['close'], new_data['close'])
     return p_value < threshold
-
 def predict(model_path: str, input_data: pd.DataFrame, provider='VitisAIExecutionProvider'):
     """使用 ONNX 模型進行推理，支援 NPU。"""
     # 函數說明：載入 ONNX 模型並進行預測，支持多種執行提供者。
     try:
         session = ort.InferenceSession(model_path, providers=[provider, 'CUDAExecutionProvider', 'CPUExecutionProvider'])
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
-        X = input_data[features].iloc[-1:].values.astype(np.float32)
+        X = input_data[FEATURES].iloc[-1:].values.astype(np.float32)
         return session.run(None, {'input': X})[0][0]
     except Exception as e:
         logging.error(f"ONNX 推理錯誤: {e}")
         return 0.0
-
 def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'normal', device_config: dict = None) -> dict:
     """更新多模型：個別檢查並訓練或載入模型，根據時段加權預測。"""
     # 函數說明：更新多個模型，若數據漂移則重新訓練，並定義加權預測函數。
@@ -384,12 +403,14 @@ def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'n
         model_dir = Path(model_path)
         model_dir.mkdir(exist_ok=True)
         models = {}
-        features = ['Close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
         # 關鍵邏輯：檢測數據漂移，若存在則重新訓練模型。
         old_data = df.iloc[:-1000] if len(df) > 1000 else df
         new_data = df.iloc[-1000:]
         data_drift = detect_drift(old_data, new_data)
         device = device_config.get('lstm', torch.device('cpu')) if device_config else torch.device('cpu')
+        df_clean = df[FEATURES].dropna()
+        X = df_clean.values[:-1]
+        y = df['close'].shift(-1).dropna().values
         # LSTM 模型
         lstm_path = model_dir / 'lstm_model.pth'
         lstm_onnx_path = model_dir / 'lstm_model_quantized.onnx'
@@ -410,7 +431,7 @@ def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'n
         rf_path = model_dir / 'rf_model.pkl'
         rf_onnx_path = model_dir / 'rf_model_quantized.onnx'
         if not rf_path.exists() or data_drift:
-            models['rf_model'] = train_rf_model(df)
+            models['rf_model'] = train_random_forest_model(df)
         else:
             models['rf_model'] = rf_onnx_path
             logging.info("載入現有 RandomForest ONNX 模型")
@@ -446,7 +467,7 @@ def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'n
         }
         def predict_price(input_data: pd.DataFrame):
             # 內部函數說明：根據輸入數據進行加權預測，忽略情緒模型。
-            if input_data.empty or features[0] not in input_data.columns:
+            if input_data.empty or FEATURES[0] not in input_data.columns:
                 logging.error("輸入數據為空或缺少必要欄位")
                 return 0.0
             predictions = {}
@@ -456,7 +477,7 @@ def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'n
                 if isinstance(model, str):
                     predictions[name] = predict(model, input_data)
                 else:
-                    X = input_data[features].iloc[-1:].values
+                    X = input_data[FEATURES].iloc[-1:].values
                     if name == 'lstm' or name == 'timeseries_transformer':
                         X_tensor = torch.tensor(X, dtype=torch.float32, device=device).unsqueeze(1)
                         model.eval()
