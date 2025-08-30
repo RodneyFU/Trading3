@@ -14,7 +14,7 @@
 <body>
     <h1>Python Code Analysis</h1>
     <h2>.\ai_models.py</h2>
-    <pre><code>import torch
+    <pre><code><script type="text/python">import torch
 from torch import nn
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -508,10 +508,10 @@ def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'n
         return models
     except Exception as e:
         logging.error(f"多模型更新錯誤: {e}")
-        return {}</code></pre>
+        return {}</script></code></pre>
 
     <h2>.\code_to_html.py</h2>
-    <pre><code>import os
+    <pre><code><script type="text/python">import os
 
 def py_to_html(root_dir: str = '.', output_file: str = 'all_code.html'):
     """將所有 PY 檔內容合併到 HTML。
@@ -546,13 +546,12 @@ def py_to_html(root_dir: str = '.', output_file: str = 'all_code.html'):
                     path = os.path.join(subdir, file)
                     print(f"合併：{path}")
                     html_content += f'    &lt;h2&gt;{path}&lt;/h2&gt;\n'
-                    html_content += '    &lt;pre&gt;&lt;code&gt;'
+                    html_content += '    &lt;pre&gt;&lt;code&gt;&lt;script type="text/python"&gt;'
                     with open(path, 'r', encoding='utf-8') as f:
                         # Escape HTML special characters to ensure valid rendering
                         content = f.read().replace('&amp;', '&amp;amp;').replace('&lt;', '&amp;lt;').replace('&gt;', '&amp;gt;')
                         html_content += content
-                    html_content += '&lt;/code&gt;&lt;/pre&gt;\n\n'
-        
+                    html_content += '&lt;/script&gt;&lt;/code&gt;&lt;/pre&gt;\n\n'        
         html_content += """&lt;/body&gt;
 &lt;/html&gt;"""
         out.write(html_content)
@@ -560,10 +559,10 @@ def py_to_html(root_dir: str = '.', output_file: str = 'all_code.html'):
     print(f"合併完成：{output_file}")
 
 if __name__ == "__main__":
-    py_to_html()</code></pre>
+    py_to_html()</script></code></pre>
 
     <h2>.\data_acquisition.py</h2>
-    <pre><code>import yfinance as yf
+    <pre><code><script type="text/python">import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import json
@@ -1282,10 +1281,10 @@ async def fetch_economic_calendar(date_range: dict, db_path: str, config: dict) 
             logging.warning(f"Invalid or missing columns in {CSV_PATH}, columns={df.columns.tolist()}")
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 警告：經濟日曆數據為空")
     logging.warning("Economic calendar is empty")
-    return pd.DataFrame()</code></pre>
+    return pd.DataFrame()</script></code></pre>
 
     <h2>.\main.py</h2>
-    <pre><code>import asyncio
+    <pre><code><script type="text/python">import asyncio
 import logging
 import logging.handlers
 import pandas as pd
@@ -1568,10 +1567,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="USD/JPY 自動交易系統")
     parser.add_argument('--mode', choices=['backtest', 'live'], default='backtest', help="運行模式：回測或實時交易")
     args = parser.parse_args()
-    asyncio.run(main(args.mode))</code></pre>
+    asyncio.run(main(args.mode))</script></code></pre>
 
     <h2>.\risk_management.py</h2>
-    <pre><code>import xgboost as xgb
+    <pre><code><script type="text/python">import xgboost as xgb
 import pandas as pd
 import logging
 from psutil import virtual_memory, cpu_percent
@@ -1681,10 +1680,10 @@ def predict_volatility(df: pd.DataFrame, model_path: str = 'models/lightgbm_mode
         return pred
     except Exception as e:
         logging.error(f"波動預測錯誤: {e}")
-        return df['ATR'].mean()</code></pre>
+        return df['ATR'].mean()</script></code></pre>
 
     <h2>.\trading_strategy.py</h2>
-    <pre><code>from stable_baselines3 import PPO
+    <pre><code><script type="text/python">from stable_baselines3 import PPO
 import gymnasium as gym
 import numpy as np
 import pandas as pd
@@ -1917,10 +1916,10 @@ def execute_trade(ib, action: str, price: float, quantity: float, stop_loss: flo
         except Exception as e:
             logging.error(f"交易執行錯誤: {e}, 重試 {attempt + 1}/3")
         ib.sleep(2 ** attempt * 2)
-    logging.error("交易執行失敗，超過最大重試次數")</code></pre>
+    logging.error("交易執行失敗，超過最大重試次數")</script></code></pre>
 
     <h2>.\utils.py</h2>
-    <pre><code>import torch
+    <pre><code><script type="text/python">import torch
 import onnxruntime as ort
 import redis
 import aiohttp
@@ -2445,10 +2444,10 @@ def filter_future_dates(df: pd.DataFrame) -&gt; pd.DataFrame:
         df = df[df['date'] &lt;= current_time].copy()
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已過濾未來日期，初始行數={initial_rows}，剩餘行數={len(df)}")
         logging.info(f"Filtered future dates, initial_rows={initial_rows}, remaining_rows={len(df)}")
-    return df</code></pre>
+    return df</script></code></pre>
 
     <h2>.\config\system_config.json</h2>
-    <pre><code>{
+    <pre><code><script type="text/python">{
     "data_source": "polygon",
     "symbol": "USDJPY=X",
     "timeframe": "1d",
@@ -2505,10 +2504,10 @@ def filter_future_dates(df: pd.DataFrame) -&gt; pd.DataFrame:
     "model_dir": "models",
     "model_periods": ["short_term", "medium_term", "long_term"],
     "use_redis": false
-}</code></pre>
+}</script></code></pre>
 
     <h2>.\config\trading_params.json</h2>
-    <pre><code>{
+    <pre><code><script type="text/python">{
     "ppo_learning_rate": 0.0003,
     "ppo_timesteps": 10000,
 "max_position_size": 10000,
@@ -2524,7 +2523,7 @@ def filter_future_dates(df: pd.DataFrame) -&gt; pd.DataFrame:
     "risk_percent": 0.01,
     "atr_threshold": 0.02,
     "min_backtest_days": 180
-}</code></pre>
+}</script></code></pre>
 
 </body>
 </html>
